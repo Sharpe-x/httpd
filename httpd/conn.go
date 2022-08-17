@@ -42,7 +42,7 @@ type conn struct {
 	// 首部字段的每个key-value都占用一行(\r\n是换行符)，为了方便解析，我们的reader应该有ReadLine方法。这是第二个改进，改进用到了标准库的bufio.Reader。
 
 	lr   *io.LimitedReader
-	bufw *bufio.Writer// 是对lr 的封装 写数据时直接操作bufw，bufw进而写入到tcp连接。
+	bufw *bufio.Writer // 是对lr 的封装 写数据时直接操作bufw，bufw进而写入到tcp连接。
 }
 
 func newConn(rwc net.Conn, svr *Server) *conn {
@@ -62,7 +62,7 @@ func (c *conn) serve() {
 			log.Printf("panic recovered,err: %v\n", err)
 			var trace [4096]byte
 			n := runtime.Stack(trace[:], false)
-			fmt.Printf("panic stack is %s:\n",string(trace[:n]))
+			fmt.Printf("panic stack is %s:\n", string(trace[:n]))
 		}
 		c.close()
 	}()
@@ -73,6 +73,12 @@ func (c *conn) serve() {
 		// 因此在HTTP 1.1中进行了巨大的改进，即如果将要请求的资源在同一台服务器上，则我只需要建立一个TCP连接，所有的HTTP请求都通过这个连接传输，平均下来可以减少一半的传播时延。
 		//如果客户端的请求头中包含connection: keep-alive字段，则我们的服务器应该有义务保证长连接的维持，并持续从中读取HTTP请求，因此这里我们使用for循环。
 
+		var err error
+		defer func() {
+			if err != nil {
+				fmt.Println(err)
+			}
+		}()
 		req, err := c.readRequest() //解析出Request
 		if err != nil {
 			handleError(err, c) // 将错误单独交给handleErr处理
@@ -88,12 +94,15 @@ func (c *conn) serve() {
 
 		// 有了用户关心的Request和response之后，传入用户提供的回调函数即可
 		c.svr.Handler.ServeHTTP(res, req)
+		if err = req.finishRequest(); err != nil {
+			return
+		}
 
 		// 写入操作都将直接操纵bufw，其缓存的默认大小为4KB。
 		// 在一个请求处理结束后，bufw的缓存切片中还缓存有部分数据，我们需要调用Flush保证数据全部发送。
-		if err = c.bufw.Flush(); err != nil {
-			return
-		}
+		// if err = c.bufw.Flush(); err != nil {
+		// 	return
+		// }
 	}
 
 }

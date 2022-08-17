@@ -5,7 +5,9 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -163,8 +165,44 @@ func (e *eofReader) Read([]byte) (n int, err error) {
 	return 0, io.EOF
 }
 
+// 为了提高性能我们将POST表单的解析权交给用户，为此我们给Request结构体封装一个Body字段，作为IO的接口。
+// 报文主体就是用于携带客户端的额外信息，由于报文主体中能包含任何信息，更是不限长度，所以http协议就不能像首部字段一样以某个字符如CRLF为边界，来标记报文主体的范围。那么客户端是怎么保证服务端能够完整的不多不少的读出报文主体数据呢？
+// 其实很简单，我们只要在首部字段中用一项标记报文主体长度，就解决了问题。就以上述报文为例，首部字段中包含一个Content-Length字段
+// 除了使用Content-Length之外，http还可以使用chunk编码的方式
+// http报文的头部部分很短，上一章中框架将这部分读取并解析后直接交给用户，既省时也省力。
+// 但问题是http的报文主体是不限长度的，框架无脑将这些字节数据读出来，是很糟糕的设计。
+// 最明智的做法是，将这个解析的主动权交给用户，框架只提供方便用户读取解析报文主体的接口而已。
+// 并且不需要指定长度就能将报文主体不多不少读出
+
+// 要保证Body达到我们期望的行为，这就意味着Body提供的Read方法能够保证以下两点：
+
+// 对Body读取的这个指针一开始应该指向报文主体的开头，也就是说不能将报文主体前面的首部字段读出。规定了读取的起始。
+// 多个http的请求相继在tcp连接上传输，当前http请求的Body就应该只能读取到当前请求的报文主体，即只能读取Content-Length长度的数据。规定了读取的结束。
+// 如果单纯保证第一点，完全可以用上一文中conn结构体的bufr字段作为Body，因为我们已经将首部字段从bufr中读出，下一次对bufr的读取自然会从报文主体开始。
+//但这样做，第二点就无法满足。在go语言中，对一个io.Reader的读取，如果返回io.EOF错误代表我们将这个Reader中的所有数据读取完了。
+// ioutil.ReadAll就是利用了这个特点，如果不出现一些异常错误，它会不停的读取数据直至出现io.EOF。而一个网络连接net.Conn，只有在对端主动将连接关闭后，对net.Conn的Read才会返回io.EOF错误。
 func (r *Request) setupBody() {
-	r.Body = new(eofReader)
+	
+	if r.Method != "POST" && r.Method != "PUT" { // POST 和 PUT外的方法不允许设置包文主体
+		r.Body = new(eofReader)
+	}else if r.chunked(){
+		r.Body = &chunkReader{
+			bufr:r.conn.bufr,
+		}
+		// 为了防止资源的浪费，有些客户端在发送完http首部之后，发送body数据前，会先通过发送Expect: 100-continue查询服务端是否希望接受body数据，服务端只有回复了HTTP/1.1 100 Continue客户端才会再次发送body。因此我们也要处理这种情况
+		r.fixExpectContinueReader()	
+	}else if cl := r.Header.Get("Content-Length");cl!="" {
+		contentLength,err := strconv.ParseInt(cl,10,64)
+		if err != nil {
+			r.Body = new(eofReader)
+			return
+		}
+		// 允许Body最多读取contentLength的数据
+		r.Body = io.LimitReader(r.conn.bufr,contentLength)
+		r.fixExpectContinueReader()
+	}else{
+		r.Body = new(eofReader)
+	}
 }
 
 /*我们给域名生成的cookie，一旦颁发给用户浏览器之后，浏览器在访问我们域名下的后端接口时都会在请求报文中将这个cookie带上，要是后端接口不关系客户端的cookie，而框架无脑全部提前解析，这就做了徒工。
@@ -212,4 +250,48 @@ func (r *Request) parseCookies() {
 		}
 
 	}
+}
+
+func (r *Request) chunked() bool {
+	te := r.Header.Get("Transfer-Encoding")
+	return te == "chunked"
+}
+
+type expectContinueReader struct {
+	wroteContinue bool // 是否已经发送过100 continue
+	r io.Reader 
+	w *bufio.Writer
+}
+
+func (er *expectContinueReader) Read(p []byte)(n int,err error){
+    //第一次读取前发送100 continue
+	// 一旦发现客户端的请求报文的首部中存在Expect: 100-continue，那么我们在第一次读取body时，也就意味希望接受报文主体，expectContinueReader会自动发送HTTP/1.1 100 Continue
+	if !er.wroteContinue{
+		er.w.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
+		er.w.Flush()
+		er.wroteContinue = true
+	}
+	return er.r.Read(p)
+}
+
+func (r *Request) fixExpectContinueReader() {
+	if r.Header.Get("Expect") != "100-continue" {
+		return
+	}
+	r.Body = &expectContinueReader{
+		r: r.Body,
+		w:r.conn.bufw,
+	}
+}
+
+// 如果用户在Handler的回调函数中没有去读取Body的数据，就意味着处理同一个socket连接上的下一个http报文时，
+// Body未消费的数据会干扰下一个http报文的解析。所以我们的框架还需要在Handler结束后，将当前http请求的数据给消费掉。给Request增加一个finishRequest方法，以后的一些善尾工作都将交给它
+
+func (r *Request) finishRequest() (err error) {
+	// 
+	if err = r.conn.bufw.Flush(); err != nil {
+		return
+	}
+	_,err = io.Copy(ioutil.Discard, r.Body)
+	return err
 }
