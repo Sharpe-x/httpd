@@ -80,7 +80,7 @@ func readRequest(c *conn) (r *Request, err error) {
 	// 解析queryString
 	r.parseQuery()
 	// 读取header
-	r.Header, err = readerHeader(c.bufr)
+	r.Header, err = readHeader(c.bufr)
 	if err != nil {
 		return
 	}
@@ -131,7 +131,7 @@ func parseQuery(rawQuery string) map[string]string {
 	return queries
 }
 
-func readerHeader(bufr *bufio.Reader) (Header, error) {
+func readHeader(bufr *bufio.Reader) (Header, error) {
 	header := make(Header)
 
 	for {

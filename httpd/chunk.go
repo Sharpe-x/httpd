@@ -42,22 +42,22 @@ import (
 // 所以我们的chunkReader还需要具有解码chunk的功能，保证用户调用到的Read方法只读到有效载荷(chunk data)：hello, this is chunked data sent by client!。
 
 type chunkReader struct {
-	n int // 当前处理的块中还有多少字节未读
-	bufr *bufio.Reader 
+	n    int // 当前处理的块中还有多少字节未读
+	bufr *bufio.Reader
 
-	done bool // 是否读取完成
+	done bool    // 是否读取完成
 	crlf [2]byte // 读取\r\n
 }
 
-func (cr *chunkReader) Read(p []byte) (n int,err error) {
+func (cr *chunkReader) Read(p []byte) (n int, err error) {
 	// 报文主体读取完后，不允许再读
 	if cr.done {
-		return 0,io.EOF
+		return 0, io.EOF
 	}
 
 	// 当前这一块读完了，读下一块
 	if cr.n == 0 {
-		cr.n,err = cr.getChunkSize()
+		cr.n, err = cr.getChunkSize()
 		if err != nil {
 			return
 		}
@@ -65,14 +65,14 @@ func (cr *chunkReader) Read(p []byte) (n int,err error) {
 
 	if cr.n == 0 { // 获取到的chunkSize为0，说明读到了chunk报文结尾
 		cr.done = true
-		err = cr.discardCRLF()         //将最后的CRLF消费掉，防止影响下一个http报文的解析
+		err = cr.discardCRLF() //将最后的CRLF消费掉，防止影响下一个http报文的解析
 		return
 	}
 	//如果当前块剩余的数据大于欲读取的长度
 	if len(p) <= cr.n {
-		n,err = cr.bufr.Read(p)
+		n, err = cr.bufr.Read(p)
 		cr.n -= n
-		return n,err
+		return n, err
 	}
 
 	//如果当前块剩余的数据不够欲读取的长度，将剩余的数据全部取出返回
@@ -82,28 +82,41 @@ func (cr *chunkReader) Read(p []byte) (n int,err error) {
 	if err = cr.discardCRLF(); err != nil {
 		return
 	}
-	return 
+	return
 }
 
-func (cr *chunkReader) getChunkSize() (size int,err error) {
-	line,err := readLine(cr.bufr)
+func (cr *chunkReader) getChunkSize() (chunkSize int, err error) {
+	line, err := readLine(cr.bufr)
 	if err != nil {
 		return
 	}
 
-	sizeInt64,err := strconv.ParseInt(string(line),10,64)
+	//将16进制换算成10进制
+	// for i := 0; i < len(line); i++ {
+	// 	switch {
+	// 	case 'a' <= line[i] && line[i] <= 'f':
+	// 		chunkSize = chunkSize*16 + int(line[i]-'a') + 10
+	// 	case 'A' <= line[i] && line[i] <= 'F':
+	// 		chunkSize = chunkSize*16 + int(line[i]-'A') + 10
+	// 	case '0' <= line[i] && line[i] <= '9':
+	// 		chunkSize = chunkSize*16 + int(line[i]-'0')
+	// 	default:
+	// 		return 0, errors.New("illegal hex number")
+	// 	}
+	// }
+	chunkSizeInt64, err := strconv.ParseInt(string(line), 16, 64)
 	if err != nil {
-		return
+		return 0, err
 	}
-	size = int(sizeInt64)
-	return 
+
+	return int(chunkSizeInt64), nil
 }
 
 func (cr *chunkReader) discardCRLF() (err error) {
-	if _,err = io.ReadFull(cr.bufr,cr.crlf[:]);err == nil{
+	if _, err = io.ReadFull(cr.bufr, cr.crlf[:]); err == nil {
 		if cr.crlf[0] != '\r' || cr.crlf[1] != '\n' {
 			return errors.New("unsupported encoding format of chunk")
 		}
 	}
-	return 
+	return
 }
