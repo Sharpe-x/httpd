@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"strings"
 )
 
 const bufSize = 4096
@@ -101,6 +102,48 @@ func (p *Part) Read(buf []byte) (n int, err error) {
 		maxRead = len(buf)
 	}
 	return bufr.Read(buf[:maxRead])
+}
+
+// 获取FormName
+func (p *Part) FormName() string {
+	if !p.parsed {
+		p.parseFormData()
+	}
+	return p.formName
+}
+
+// 获取FileName
+func (p *Part) FileName() string {
+	if !p.parsed {
+		p.parseFormData()
+	}
+	return p.fileName
+}
+
+func (p *Part) parseFormData() {
+	p.parsed = true
+	cd := p.Header.Get("Content-Disposition")
+	ss := strings.Split(cd, ";")
+	if len(ss) == 1 || strings.ToLower(ss[0]) != "form-data" {
+		return
+	}
+	for _, s := range ss {
+		key, value := getKV(s)
+		switch key {
+		case "name":
+			p.formName = value
+		case "filename":
+			p.fileName = value
+		}
+	}
+}
+
+func getKV(s string) (key string, value string) {
+	ss := strings.Split(s, "=")
+	if len(ss) != 2 {
+		return
+	}
+	return strings.TrimSpace(ss[0]), strings.Trim(ss[1], `"`)
 }
 
 func NewMultipartReader(r io.Reader, boundary string) *MultipartReader {

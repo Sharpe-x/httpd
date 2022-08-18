@@ -3,6 +3,7 @@ package httpd
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -51,6 +52,9 @@ type Request struct {
 	RemoteAddr string // 客户端地址
 	RequestURI string // 字符串形式的url
 	conn       *conn  // 产生此request 的http连接
+
+	contentType string //
+	boundary    string //
 }
 
 func readRequest(c *conn) (r *Request, err error) {
@@ -88,8 +92,35 @@ func readRequest(c *conn) (r *Request, err error) {
 	const noLimit = (1 << 63) - 1
 	r.conn.lr.N = noLimit // Body的读取无需进行读取字节数限制
 	r.setupBody()         // 设置Body
-
+	r.parseContentType()
 	return
+}
+
+func (r *Request) parseContentType() {
+	ct := r.Header.Get("Content-Type")
+
+	index := strings.IndexByte(ct, ';')
+	if index == -1 {
+		r.contentType = ct
+		return
+	}
+
+	if index == len(ct)-1 {
+		return
+	}
+
+	ss := strings.Split(ct[index+1:], "=")
+	if len(ss) < 2 || strings.TrimSpace(ss[0]) != "boundary" {
+		return
+	}
+	r.contentType, r.boundary = ct[:index], strings.Trim(ss[1], `"`)
+}
+
+func (r *Request) MultipartReader() (*MultipartReader, error) {
+	if r.boundary == "" {
+		return nil,errors.New("no boundary detected")
+	}
+	return NewMultipartReader(r.Body, r.boundary),nil
 }
 
 // bufio.Reader具有ReadLine方法，其存在三个返回参数line []byte, isPrefix bool, err error，line和err都很好理解，
@@ -182,25 +213,25 @@ func (e *eofReader) Read([]byte) (n int, err error) {
 //但这样做，第二点就无法满足。在go语言中，对一个io.Reader的读取，如果返回io.EOF错误代表我们将这个Reader中的所有数据读取完了。
 // ioutil.ReadAll就是利用了这个特点，如果不出现一些异常错误，它会不停的读取数据直至出现io.EOF。而一个网络连接net.Conn，只有在对端主动将连接关闭后，对net.Conn的Read才会返回io.EOF错误。
 func (r *Request) setupBody() {
-	
+
 	if r.Method != "POST" && r.Method != "PUT" { // POST 和 PUT外的方法不允许设置包文主体
 		r.Body = new(eofReader)
-	}else if r.chunked(){
+	} else if r.chunked() {
 		r.Body = &chunkReader{
-			bufr:r.conn.bufr,
+			bufr: r.conn.bufr,
 		}
 		// 为了防止资源的浪费，有些客户端在发送完http首部之后，发送body数据前，会先通过发送Expect: 100-continue查询服务端是否希望接受body数据，服务端只有回复了HTTP/1.1 100 Continue客户端才会再次发送body。因此我们也要处理这种情况
-		r.fixExpectContinueReader()	
-	}else if cl := r.Header.Get("Content-Length");cl!="" {
-		contentLength,err := strconv.ParseInt(cl,10,64)
+		r.fixExpectContinueReader()
+	} else if cl := r.Header.Get("Content-Length"); cl != "" {
+		contentLength, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil {
 			r.Body = new(eofReader)
 			return
 		}
 		// 允许Body最多读取contentLength的数据
-		r.Body = io.LimitReader(r.conn.bufr,contentLength)
+		r.Body = io.LimitReader(r.conn.bufr, contentLength)
 		r.fixExpectContinueReader()
-	}else{
+	} else {
 		r.Body = new(eofReader)
 	}
 }
@@ -259,14 +290,14 @@ func (r *Request) chunked() bool {
 
 type expectContinueReader struct {
 	wroteContinue bool // 是否已经发送过100 continue
-	r io.Reader 
-	w *bufio.Writer
+	r             io.Reader
+	w             *bufio.Writer
 }
 
-func (er *expectContinueReader) Read(p []byte)(n int,err error){
-    //第一次读取前发送100 continue
+func (er *expectContinueReader) Read(p []byte) (n int, err error) {
+	//第一次读取前发送100 continue
 	// 一旦发现客户端的请求报文的首部中存在Expect: 100-continue，那么我们在第一次读取body时，也就意味希望接受报文主体，expectContinueReader会自动发送HTTP/1.1 100 Continue
-	if !er.wroteContinue{
+	if !er.wroteContinue {
 		er.w.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
 		er.w.Flush()
 		er.wroteContinue = true
@@ -280,7 +311,7 @@ func (r *Request) fixExpectContinueReader() {
 	}
 	r.Body = &expectContinueReader{
 		r: r.Body,
-		w:r.conn.bufw,
+		w: r.conn.bufw,
 	}
 }
 
@@ -288,10 +319,10 @@ func (r *Request) fixExpectContinueReader() {
 // Body未消费的数据会干扰下一个http报文的解析。所以我们的框架还需要在Handler结束后，将当前http请求的数据给消费掉。给Request增加一个finishRequest方法，以后的一些善尾工作都将交给它
 
 func (r *Request) finishRequest() (err error) {
-	// 
+	//
 	if err = r.conn.bufw.Flush(); err != nil {
 		return
 	}
-	_,err = io.Copy(ioutil.Discard, r.Body)
+	_, err = io.Copy(ioutil.Discard, r.Body)
 	return err
 }
